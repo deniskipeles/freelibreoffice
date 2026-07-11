@@ -88,9 +88,16 @@ export default function Home() {
               FreeLibreOffice <span className="text-blue-600 dark:text-blue-400">Converter</span>
             </span>
             <span className="px-2 py-0.5 text-xs rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 font-medium border border-zinc-200 dark:border-zinc-700">
-              Zero Hardcode Fork Ready
+              Multi-Domain Optimized
             </span>
           </div>
+          {/* Navigation link to Docs */}
+          <a
+            href="/docs"
+            className="text-sm font-semibold text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors flex items-center gap-1.5"
+          >
+            API Reference Docs →
+          </a>
         </div>
       </header>
 
