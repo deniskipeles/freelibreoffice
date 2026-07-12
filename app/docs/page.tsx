@@ -206,6 +206,8 @@ func main() {
   "hash": "eebcd49494a4d378e81dbb8d7...",
   "format": "webp",
   "mimeType": "image/webp",
+  "totalPages": 12,
+  "actualPage": 1,
   "url": "https://${host}/api/convert?hash=eebcd49494a4d378e81dbb8d7...&format=webp&page=1&quality=80"
 }`}
               </pre>

@@ -4,11 +4,8 @@ export const runtime = 'edge';
 
 const DOCUMENT_CONVERT_TOOL_URL = process.env.DOCUMENT_CONVERT_TOOL_URL || 'https://localhost:3000';
 
-// Fallback in-memory cache for environments without Cloudflare CDN cache (e.g. Hugging Face, Localhost)
-// Declared globally so it persists across server requests.
 const memoryCache = new Map<string, { body: ArrayBuffer; contentType: string }>();
 
-// CORS Handler helper
 function handleCors(req: NextRequest, response: Response): Response {
   const origin = req.headers.get('origin') || '*';
   const newHeaders = new Headers(response.headers);
@@ -39,7 +36,6 @@ export async function GET(req: NextRequest) {
   const page = req.nextUrl.searchParams.get('page') || '1';
   const quality = req.nextUrl.searchParams.get('quality') || '80';
 
-  // ACTION 1: Act as the stream server
   if (hash) {
     const cacheKeyUrl = `https://api.freelibreoffice.pages.dev/cache/${hash}-p${page}-q${quality}.${format}`;
     const cacheKey = new Request(cacheKeyUrl);
@@ -47,24 +43,19 @@ export async function GET(req: NextRequest) {
     const globalCaches = typeof caches !== 'undefined' ? (caches as any) : null;
     const cfCache = globalCaches && globalCaches.default ? globalCaches.default : null;
 
-    // A. Attempt to retrieve from Cloudflare CDN first
     if (cfCache) {
       try {
         const cachedResponse = await cfCache.match(cacheKey);
         if (cachedResponse) {
-          console.log('Serving from Cloudflare CDN Edge Cache');
           return handleCors(req, cachedResponse);
         }
       } catch (err) {
-        console.warn('CDN Cache lookup failed:', err);
+        console.warn('Cache error:', err);
       }
-    } 
-    // B. Fallback to Local Memory Cache (For Hugging Face / Local Dev)
-    else {
+    } else {
       const cacheId = `${hash}-p${page}-q${quality}.${format}`;
       const cached = memoryCache.get(cacheId);
       if (cached) {
-        console.log(`Serving from Memory Cache (Hugging Face Fallback): ${cacheId}`);
         return handleCors(req, new Response(cached.body, {
           headers: { 
             'Content-Type': cached.contentType,
@@ -73,7 +64,6 @@ export async function GET(req: NextRequest) {
         }));
       }
     }
-
     return handleCors(req, new Response('File expired or not found. Please re-upload.', { status: 410 }));
   }
 
@@ -84,11 +74,10 @@ export async function POST(req: NextRequest) {
   return handleConversion(req);
 }
 
-// ACTION 2: Process document, cache, and return dynamic JSON url metadata
 async function handleConversion(req: NextRequest) {
   try {
     const format = req.nextUrl.searchParams.get('format') || 'pdf';
-    const page = req.nextUrl.searchParams.get('page') || '1';
+    const page = parseInt(req.nextUrl.searchParams.get('page') || '1', 10);
     const quality = req.nextUrl.searchParams.get('quality') || '80';
     const queryUrl = req.nextUrl.searchParams.get('url');
 
@@ -123,26 +112,33 @@ async function handleConversion(req: NextRequest) {
     }
 
     const fileHash = await sha256(fileBuffer);
-    const cacheKeyUrl = `https://api.freelibreoffice.pages.dev/cache/${fileHash}-p${page}-q${quality}.${format}`;
-    const cacheKey = new Request(cacheKeyUrl);
-    
     const globalCaches = typeof caches !== 'undefined' ? (caches as any) : null;
     const cfCache = globalCaches && globalCaches.default ? globalCaches.default : null;
 
     let isCached = false;
-    
-    // Check CDN Cache
+    let cachedTotalPages = '1';
+    let cachedActualPage = page.toString();
+
+    // Check Cache by requested page
+    const requestedCacheId = `${fileHash}-p${page}-q${quality}.${format}`;
+    const requestedCacheKeyUrl = `https://api.freelibreoffice.pages.dev/cache/${requestedCacheId}`;
+    const requestedCacheKey = new Request(requestedCacheKeyUrl);
+
     if (cfCache) {
-      const cached = await cfCache.match(cacheKey);
-      if (cached) isCached = true;
-    } 
-    // Check Local Memory Cache fallback
-    else {
-      const cacheId = `${fileHash}-p${page}-q${quality}.${format}`;
-      if (memoryCache.has(cacheId)) isCached = true;
+      const cached = await cfCache.match(requestedCacheKey);
+      if (cached) {
+        isCached = true;
+        cachedTotalPages = cached.headers.get('X-Total-Pages') || '1';
+        cachedActualPage = cached.headers.get('X-Actual-Page') || page.toString();
+      }
+    } else if (memoryCache.has(requestedCacheId)) {
+      isCached = true;
+      // In-memory cache hit uses the requested page values
     }
 
-    // Process if missing from both caches
+    let totalPages = parseInt(cachedTotalPages, 10);
+    let actualPage = parseInt(cachedActualPage, 10);
+
     if (!isCached) {
       const targetUrl = `${DOCUMENT_CONVERT_TOOL_URL}/process?format=${format}&page=${page}&quality=${quality}`;
       const hfFormData = new FormData();
@@ -152,6 +148,9 @@ async function handleConversion(req: NextRequest) {
       const hfResponse = await fetch(targetUrl, { method: 'POST', body: hfFormData });
       if (!hfResponse.ok) throw new Error(await hfResponse.text());
 
+      totalPages = parseInt(hfResponse.headers.get('X-Total-Pages') || '1', 10);
+      actualPage = parseInt(hfResponse.headers.get('X-Actual-Page') || page.toString(), 10);
+
       const pdfArrayBuffer = await hfResponse.arrayBuffer();
       const responseContentType = hfResponse.headers.get('Content-Type') || 'application/octet-stream';
 
@@ -159,33 +158,42 @@ async function handleConversion(req: NextRequest) {
         headers: {
           'Content-Type': responseContentType,
           'Cache-Control': 'public, max-age=31536000, s-maxage=31536000',
+          'X-Total-Pages': totalPages.toString(),
+          'X-Actual-Page': actualPage.toString()
         }
       });
 
-      // A. Write to CDN cache if on Cloudflare
+      // Write output to CDN or local memory cache
       if (cfCache) {
-        await cfCache.put(cacheKey, finalResponse.clone());
-      } 
-      // B. Write to Local Memory cache if on Hugging Face
-      else {
-        const cacheId = `${fileHash}-p${page}-q${quality}.${format}`;
-        memoryCache.set(cacheId, {
-          body: pdfArrayBuffer,
-          contentType: responseContentType
-        });
+        // Cache under requested page
+        await cfCache.put(requestedCacheKey, finalResponse.clone());
+        
+        // Optimize: Also cache under canonical page to prevent duplicate backend calls
+        if (page !== actualPage) {
+          const canonicalCacheKey = new Request(`https://api.freelibreoffice.pages.dev/cache/${fileHash}-p${actualPage}-q${quality}.${format}`);
+          await cfCache.put(canonicalCacheKey, finalResponse.clone());
+        }
+      } else {
+        memoryCache.set(requestedCacheId, { body: pdfArrayBuffer, contentType: responseContentType });
+        if (page !== actualPage) {
+          memoryCache.set(`${fileHash}-p${actualPage}-q${quality}.${format}`, { body: pdfArrayBuffer, contentType: responseContentType });
+        }
       }
     }
 
-    // Dynamic self-referential hostname detection
     const host = req.headers.get('host') || 'api.freelibreoffice.pages.dev';
     const protocol = host.includes('localhost') || host.includes('127.0.0.1') ? 'http' : 'https';
-    const dynamicStreamUrl = `${protocol}://${host}/api/convert?hash=${fileHash}&format=${format}&page=${page}&quality=${quality}`;
+    
+    // Output URL uses the canonical actualPage to maximize cache sharing
+    const dynamicStreamUrl = `${protocol}://${host}/api/convert?hash=${fileHash}&format=${format}&page=${actualPage}&quality=${quality}`;
 
     return handleCors(req, new Response(JSON.stringify({
       success: true,
       hash: fileHash,
       format: format,
       mimeType: format === 'pdf' ? 'application/pdf' : `image/${format === 'svg' ? 'svg+xml' : format}`,
+      totalPages: totalPages,
+      actualPage: actualPage,
       url: dynamicStreamUrl
     }), {
       status: 200,
